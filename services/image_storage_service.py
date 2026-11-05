@@ -23,7 +23,7 @@ from utils.timezone import beijing_datetime_from_timestamp, beijing_now, beijing
 
 IMAGE_INDEX_FILE = DATA_DIR / "image_index.json"
 IMAGE_INDEX_LOCK = Lock()
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 IMAGE_SYNC_MERGE_BATCH_SIZE = 64
 IMAGE_MUTATION_BATCH_SIZE = 16
 
@@ -407,7 +407,8 @@ class ImageStorageService:
 
     def make_relative_path(self, image_data: bytes) -> str:
         file_hash = hashlib.md5(image_data).hexdigest()
-        filename = f"{int(time.time())}_{file_hash}.png"
+        extension = "gif" if image_data[:6] in (b"GIF87a", b"GIF89a") else "png"
+        filename = f"{int(time.time())}_{file_hash}.{extension}"
         now = beijing_now()
         relative_dir = Path(now.strftime("%Y"), now.strftime("%m"), now.strftime("%d"))
         return f"{relative_dir.as_posix()}/{filename}"
@@ -987,6 +988,9 @@ class ImageStorageService:
 
     @staticmethod
     def _compress_png(payload: bytes) -> bytes:
+        # Older releases saved GIF bytes under .png names; do not flatten them.
+        if payload[:6] in (b"GIF87a", b"GIF89a"):
+            return payload
         output = io.BytesIO()
         with Image.open(io.BytesIO(payload)) as image:
             image = ImageOps.exif_transpose(image)
