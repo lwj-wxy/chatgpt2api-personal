@@ -106,6 +106,7 @@
             :image-form="imageForm"
             :chat-model-options="chatModelOptions"
             :image-model-options="imageModelOptions"
+            :image-profiles="imageProfiles"
             :image-high-resolution-enabled="imageHighResolutionEnabled"
             :references="referenceRuntime.references.value"
             :is-sending="isSending"
@@ -516,6 +517,7 @@ const sendImageEditRequest = sendRuntime.sendImageEditRequest
 const sendMessage = sendRuntime.sendMessage
 const chatModelOptions = modelFormRuntime.chatModelOptions
 const imageModelOptions = modelFormRuntime.imageModelOptions
+const imageProfiles = modelFormRuntime.imageProfiles
 
 function ensureConversation(content = '') {
   return conversationActionsRuntime.ensureConversation(content)

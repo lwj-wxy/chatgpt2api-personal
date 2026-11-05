@@ -27,6 +27,33 @@ class ModelCatalogSource(_StrictModel):
     image: ModelCatalogSourceKind
 
 
+class ImageSizeOption(_StrictModel):
+    value: str
+    label: str
+    ratio: str
+    resolution: str
+
+
+class ImageQualityOption(_StrictModel):
+    value: str
+    label: str
+
+
+class ImageModelProfile(_StrictModel):
+    model: str
+    label: str
+    selection_mode: Literal["compatibility_alias", "conversation_tool", "tool_model"]
+    upstream_model: str
+    image_model_verified: bool = False
+    size_mode: Literal["prompt_hint", "native_parameter"]
+    quality_mode: Literal["prompt_hint", "native_parameter"]
+    size_label: str
+    quality_label: str
+    note: str
+    size_options: tuple[ImageSizeOption, ...]
+    quality_options: tuple[ImageQualityOption, ...]
+
+
 class ModelCatalogView(_StrictModel):
     object: Literal["model_catalog"] = "model_catalog"
     schema_version: Literal[1] = 1
@@ -38,6 +65,7 @@ class ModelCatalogView(_StrictModel):
     defaults: ModelCatalogDefaults
     capabilities: ModelCatalogCapabilities
     source: ModelCatalogSource
+    image_profiles: tuple[ImageModelProfile, ...] = ()
     openai_models_endpoint: Literal["/v1/models"] = "/v1/models"
 
     @model_validator(mode="after")

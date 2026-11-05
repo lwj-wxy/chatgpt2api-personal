@@ -314,6 +314,7 @@ export interface DashboardAccountStats {
   total: number
   cumulative_total: number
   active: number
+  unverified: number
   limited: number
   abnormal: number
   disabled: number

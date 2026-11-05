@@ -59,17 +59,27 @@ def image_size_from_bytes(data: bytes) -> tuple[int, int] | None:
     return int(width), int(height)
 
 
-def image_output_metadata(items: object) -> list[dict[str, int]]:
+def image_output_metadata(items: object) -> list[dict[str, Any]]:
     """Project measured output dimensions without copying or decoding image data."""
     if not isinstance(items, list):
         return []
-    metadata: list[dict[str, int]] = []
+    metadata: list[dict[str, Any]] = []
     for item in items:
         if not isinstance(item, dict) or not (item.get("url") or item.get("b64_json")):
             continue
         width, height = item.get("width"), item.get("height")
         known = all(type(value) is int and value > 0 for value in (width, height))
-        metadata.append({"width": width, "height": height} if known else {})
+        measured = {"width": width, "height": height} if known else {}
+        generation = item.get("_generation")
+        if isinstance(generation, dict):
+            for key in ("source_width", "source_height"):
+                if type(generation.get(key)) is int and generation[key] > 0:
+                    measured[key] = generation[key]
+            for key in ("postprocess", "requested_model", "upstream_model", "requested_tool_model", "reported_conversation_model", "actual_image_model", "actual_quality"):
+                value = generation.get(key)
+                if isinstance(value, str) and len(value) <= 120:
+                    measured[key] = value
+        metadata.append(measured)
     return metadata
 
 
@@ -290,12 +300,16 @@ def count_image_output_items_tokens(
     for item in items:
         image_size = None
         if isinstance(item, dict):
-            b64_json = str(item.get("b64_json") or "").strip()
-            if b64_json:
-                try:
-                    image_size = image_size_from_bytes(base64.b64decode(b64_json))
-                except Exception:
-                    image_size = None
+            width, height = item.get("width"), item.get("height")
+            if type(width) is int and type(height) is int and width > 0 and height > 0:
+                image_size = (width, height)
+            else:
+                b64_json = str(item.get("b64_json") or "").strip()
+                if b64_json:
+                    try:
+                        image_size = image_size_from_bytes(base64.b64decode(b64_json))
+                    except Exception:
+                        image_size = None
         width, height = image_size or fallback_size
         total += count_generated_image_tokens(width, height, quality)
     return total

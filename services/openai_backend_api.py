@@ -11,6 +11,7 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from collections.abc import Callable
@@ -21,6 +22,7 @@ from curl_cffi import CurlInfo, CurlOpt, requests
 from PIL import Image
 
 from services.account_service import account_service
+from services.account_credentials import access_token_has_invalid_format
 from services.config import config
 from services.editable_file_failure import EditableFileFailureError
 from services.image_failure import (
@@ -42,11 +44,15 @@ from services.image_failure import (
 from services.protocol.reasoning import normalize_thinking_effort
 from services.proxy_service import ProxyRuntimeProfile, proxy_settings
 from utils.file_names import sanitize_public_filename
-from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
+from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model, image_model_route, CODEX_RESPONSES_MODEL, CODEX_RESPONSES_IMAGE_MODEL
 from utils.diagnostics import diagnostic_excerpt
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
 from utils.turnstile import solve_turnstile_token
+
+
+ACCOUNT_PREFLIGHT_TIMEOUT = (2.0, 20.0)
+IMAGE_IDENTITY_FRESHNESS_SECONDS = 300
 
 
 @dataclass
@@ -63,7 +69,6 @@ DEFAULT_CLIENT_VERSION = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887"
 DEFAULT_CLIENT_BUILD_NUMBER = "6708908"
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
-CODEX_RESPONSES_MODEL = "gpt-5.5"
 SEARCH_MODEL = "gpt-5-5"
 SEARCH_POLL_INTERVAL_SECS = 3.0
 SEARCH_DONE_STATUS = {"finished_successfully", "finished_partial_completion", "stop"}
@@ -219,6 +224,9 @@ class OpenAIBackendAPI:
         参数：
         - `access_token`：可选。传入后表示使用已登录链路；不传则使用未登录链路。
         """
+        access_token = str(access_token or "").strip()
+        if access_token_has_invalid_format(access_token):
+            raise ValueError("Access Token 格式错误，请重新录入有效凭据")
         self.base_url = "https://chatgpt.com"
         self.client_version = DEFAULT_CLIENT_VERSION
         self.client_build_number = DEFAULT_CLIENT_BUILD_NUMBER
@@ -237,7 +245,12 @@ class OpenAIBackendAPI:
         self.progress_callback: Callable[[str], None] | None = None
         self._http_timings: dict[str, dict[str, Any]] = {}
         self._image_result_timing: dict[str, int] = {}
+        self.image_route_observation: dict[str, str] = {}
+        self._image_asset_observations: dict[str, dict[str, str]] = {}
+        self._image_resolved_assets: dict[str, str] = {}
         self._closed = False
+        # True includes an ambiguous POST outcome: never restart generation then.
+        self.image_generation_submitted = False
         explicit_proxy = str(proxy or proxy_url or "").strip()
         self.proxy_profile = proxy_profile or proxy_settings.get_profile(
             account=self.account,
@@ -518,7 +531,7 @@ class OpenAIBackendAPI:
 
     def _get_me(self) -> Dict[str, Any]:
         path = "/backend-api/me"
-        response = self.session.get(self.base_url + path, headers=self._headers(path), timeout=20)
+        response = self.session.get(self.base_url + path, headers=self._headers(path), timeout=ACCOUNT_PREFLIGHT_TIMEOUT)
         if response.status_code != 200:
             self._raise_on_error(response, path)
         return response.json()
@@ -534,7 +547,7 @@ class OpenAIBackendAPI:
                 "conversation_id": None,
                 "timezone_offset_min": -480,
             },
-            timeout=20,
+            timeout=ACCOUNT_PREFLIGHT_TIMEOUT,
         )
         if response.status_code != 200:
             self._raise_on_error(response, path)
@@ -543,7 +556,7 @@ class OpenAIBackendAPI:
     def _get_default_account(self) -> Dict[str, Any]:
         path = "/backend-api/accounts/check/v4-2023-04-27"
         response = self.session.get(self.base_url + path + "?timezone_offset_min=-480", headers=self._headers(path),
-                                    timeout=20)
+                                    timeout=ACCOUNT_PREFLIGHT_TIMEOUT)
         if response.status_code != 200:
             self._raise_on_error(response, path)
         payload = response.json()
@@ -559,8 +572,72 @@ class OpenAIBackendAPI:
         })
         return default_account
 
-    def get_user_info(self) -> Dict[str, Any]:
+    def get_user_info(self, *, image_scope: bool = False) -> Dict[str, Any]:
         """获取当前 token 的账号信息。"""
+        preflight_started = time.perf_counter()
+        try:
+            return self._get_image_user_info() if image_scope else self._get_user_info()
+        except (
+            TimeoutError, ConnectionError,
+            requests.exceptions.Timeout, requests.exceptions.ConnectionError,
+            requests.exceptions.ProxyError, requests.exceptions.SSLError,
+        ) as exc:
+            # These are read-only account checks. Auth/HTTP/quota rejections do
+            # not enter this branch and retain their existing handling.
+            if self.proxy_profile.egress_mode != "proxy":
+                raise
+            fallback = proxy_settings.get_fallback_profile(upstream=True)
+            if fallback is None or fallback.proxy_url == self.proxy_profile.proxy_url:
+                raise
+            retry_ms = int((time.perf_counter() - preflight_started) * 1000)
+            logger.warning({
+                "event": "account_preflight_egress_fallback",
+                "reason": type(exc).__name__,
+                "transport_code": getattr(exc, "code", None),
+                "from_source": self.proxy_profile.proxy_source,
+                "fallback_source": fallback.proxy_source,
+                "egress_mode": fallback.egress_mode,
+            })
+            with OpenAIBackendAPI(access_token=self.access_token, proxy_profile=fallback) as backend:
+                # Do not recurse if the fallback itself fails.
+                result = backend._get_image_user_info() if image_scope else backend._get_user_info()
+                if image_scope and fallback.egress_mode == "direct":
+                    result["_image_preflight_fallback_direct"] = True
+                    result["_image_preflight_retry_ms"] = retry_ms
+                return result
+
+    def _get_image_user_info(self) -> Dict[str, Any]:
+        account = self.account
+        # Existing records predate scoped checks: their last successful check
+        # was necessarily full. Scoped updates preserve that original timestamp.
+        checked_at = account_service._parse_time(
+            account.get("last_full_remote_checked_at", account.get("last_remote_checked_at"))
+        )
+        refreshed_at = account_service._parse_time(account.get("last_token_refresh_at"))
+        age = (datetime.now(timezone.utc) - checked_at).total_seconds() if checked_at else -1
+        if not (
+            self.access_token and account.get("email") and account.get("user_id")
+            and account_service._normalize_account_type(account.get("type"))
+            and account.get("last_remote_check_result") == "ok"
+            and 0 <= age < IMAGE_IDENTITY_FRESHNESS_SECONDS
+            and (refreshed_at is None or refreshed_at <= checked_at)
+        ):
+            return self._get_user_info()
+        # This request still proves current authorization and reads live quota.
+        # A 401/403 is propagated; cached identity never makes it a success.
+        started = time.perf_counter()
+        init_payload = self._get_conversation_init()
+        result = self._user_info_result(
+            {"email": account["email"], "id": account["user_id"]},
+            init_payload,
+            {"plan_type": account["type"]},
+        )
+        result["_image_preflight_only"] = True
+        logger.info({"event": "image_preflight_quota_only", "remote_requests": 1,
+                     "duration_ms": int((time.perf_counter() - started) * 1000)})
+        return result
+
+    def _get_user_info(self) -> Dict[str, Any]:
         if not self.access_token:
             raise RuntimeError("access_token is required")
         executor = ThreadPoolExecutor(max_workers=3)
@@ -596,11 +673,15 @@ class OpenAIBackendAPI:
         else:
             executor.shutdown(wait=True, cancel_futures=True)
 
+        return self._user_info_result(me_payload, init_payload, default_account)
+
+    @staticmethod
+    def _user_info_result(me_payload: dict, init_payload: dict, default_account: dict) -> Dict[str, Any]:
         plan_type = account_service._normalize_account_type(default_account.get("plan_type"))
 
         limits_progress = init_payload.get("limits_progress")
         limits_progress = limits_progress if isinstance(limits_progress, list) else []
-        quota, restore_at, image_quota_unknown = self._extract_quota_and_restore_at(limits_progress)
+        quota, restore_at, image_quota_unknown = OpenAIBackendAPI._extract_quota_and_restore_at(limits_progress)
         result = {
             "email": me_payload.get("email"),
             "user_id": me_payload.get("id"),
@@ -803,14 +884,59 @@ class OpenAIBackendAPI:
 
     def _image_model_slug(self, model: str) -> str:
         """把标准图片模型名映射到底层 model slug。"""
-        _, base_model = split_image_model(model)
-        if not base_model:
-            return "auto"
-        if base_model == "gpt-image-2":
-            return "gpt-5-3"
-        if base_model == CODEX_IMAGE_MODEL:
-            return base_model
-        return "auto"
+        return image_model_route(model)
+
+    def _observe_image_route(self, payload: str) -> None:
+        """Keep explicit response facts; conversation and tool arguments are not engine proof."""
+        try:
+            event = json.loads(payload)
+        except (ValueError, TypeError):
+            return
+        if not isinstance(event, dict):
+            return
+        observation = self.image_route_observation
+        if event.get("type") == "server_ste_metadata":
+            metadata = event.get("metadata") or {}
+            slug = metadata.get("model_slug") if isinstance(metadata, dict) else None
+            if isinstance(slug, str) and len(slug) <= 120:
+                observation["reported_conversation_model"] = slug
+
+        def visit(value: object) -> None:
+            if isinstance(value, dict):
+                message = value.get("message")
+                author = message.get("author") if isinstance(message, dict) else None
+                message_meta = message.get("metadata") if isinstance(message, dict) else None
+                generation_tool = isinstance(message_meta, dict) and bool(message_meta.get("image_gen_title") or message_meta.get("async_task_type") == "image_gen")
+                if isinstance(author, dict) and author.get("role") == "tool" and generation_tool:
+                    content = message.get("content") or {}
+                    parts = content.get("parts") if isinstance(content, dict) else []
+                    for part in parts or []:
+                        if not isinstance(part, dict) or part.get("content_type") != "image_asset_pointer":
+                            continue
+                        metadata = part.get("metadata") or {}
+                        generation = metadata.get("generation") if isinstance(metadata, dict) else {}
+                        pointer = str(part.get("asset_pointer") or "").split("://")[-1]
+                        if not isinstance(generation, dict) or not generation.get("gen_id") or not re.fullmatch(r"[A-Za-z0-9_-]{1,120}", pointer):
+                            continue
+                        facts = self.__dict__.setdefault("_image_asset_observations", {}).setdefault(pointer, {})
+                        for source, target in (("model", "actual_image_model"), ("quality", "actual_quality")):
+                            fact = generation.get(source)
+                            if isinstance(fact, str) and fact.strip() and len(fact) <= 120:
+                                facts[target] = fact.strip()
+                for key, nested in value.items():
+                    if key != "message" and isinstance(nested, (dict, list)):
+                        visit(nested)
+            elif isinstance(value, list):
+                for nested in value:
+                    visit(nested)
+        visit(event)
+
+    def image_evidence_for_url(self, url: str) -> dict[str, str]:
+        facts = dict(getattr(self, "image_route_observation", {}) or {})
+        asset = getattr(self, "_image_resolved_assets", {}).get(url)
+        if asset:
+            facts.update(getattr(self, "_image_asset_observations", {}).get(asset, {}))
+        return facts
 
     def _image_headers(self, path: str, requirements: ChatRequirements, conduit_token: str = "", accept: str = "*/*") -> \
             Dict[str, str]:
@@ -1098,7 +1224,7 @@ class OpenAIBackendAPI:
             "input": self._codex_image_input(prompt, images or []),
             "tools": [{
                 "type": "image_generation",
-                "model": "gpt-image-2",
+                "model": CODEX_RESPONSES_IMAGE_MODEL,
                 "action": "edit" if images else "generate",
                 "size": str(size or "1024x1024"),
                 "quality": str(quality or "auto"),
@@ -1155,10 +1281,13 @@ class OpenAIBackendAPI:
             },
         })
         stream_timeout = config.image_stream_timeout_secs
+        self.image_generation_submitted = True
         try:
             with urllib.request.urlopen(request, timeout=stream_timeout) as raw:
                 yield from self._iter_codex_response_events(raw, max_duration_secs=stream_timeout)
         except urllib.error.HTTPError as error:
+            if error.code in {401, 403, 429}:
+                self.image_generation_submitted = False
             body_text = error.read().decode("utf-8", "replace")
             body: Any = body_text
             try:
@@ -1351,6 +1480,7 @@ class OpenAIBackendAPI:
             had_total_timeout = CurlOpt.TIMEOUT_MS in curl_options
             previous_total_timeout = curl_options.get(CurlOpt.TIMEOUT_MS)
             curl_options[CurlOpt.TIMEOUT_MS] = int(transport_timeout_secs * 1000)
+        self.image_generation_submitted = True
         try:
             response = self.session.post(
                 self.base_url + path,
@@ -1359,12 +1489,22 @@ class OpenAIBackendAPI:
                 timeout=transport_timeout_secs,
                 stream=True,
             )
+        except requests.exceptions.RequestException as exc:
+            # libcurl DNS/connect/TLS-handshake errors prove no HTTP request
+            # was sent. A timeout/read error can occur after submission.
+            if getattr(exc, "code", None) in {5, 6, 7, 35}:
+                self.image_generation_submitted = False
+            raise
         finally:
             if isinstance(curl_options, dict):
                 if had_total_timeout:
                     curl_options[CurlOpt.TIMEOUT_MS] = previous_total_timeout
                 else:
                     curl_options.pop(CurlOpt.TIMEOUT_MS, None)
+        if response.status_code in {401, 403, 429}:
+            # Explicit auth/quota rejection did not start generation; retain
+            # the existing account recovery policy without changing egress.
+            self.image_generation_submitted = False
         ensure_ok(response, path)
         self._record_http_timing("image_generation_stream", response)
         return response
@@ -2856,11 +2996,14 @@ class OpenAIBackendAPI:
     ) -> tuple[list[str], list[str]]:
         """Poll the conversation document until image file ids appear or budget runs out.
 
-        - Sleeps image_poll_initial_wait_secs first (default 5s, +jitter). ChatGPT
-          image generation takes ~30s; polling immediately wastes requests and trips
-          a transient 429 the upstream returns within ~200ms of the SSE stream
-          closing (the conversation document is not yet committed).
-        - Subsequent polls are image_poll_interval_secs apart (default 5s).
+        - Fast result delivery caps the first wait at 0.5s (+jitter) to allow
+          conversation commit after SSE, without a fixed five-second delay.
+          Explicit confirmation/settle modes retain their configured waits.
+        - Fast-mode pending results use 1s then at most 2s intervals, respecting
+          a smaller configured interval. Confirmation modes keep their interval.
+        - Read conversation results first. Query task diagnostics only while
+          output IDs are absent, no more than once per five seconds.
+        - HTTP reads and sleeps share the remaining poll budget.
         - Failures marked retryable by the canonical image-failure policy back
           off exponentially (capped at 16s, +jitter), honoring Retry-After.
         - All sleeps stay within timeout_secs; on exhaustion raises ImagePollTimeoutError.
@@ -2869,7 +3012,10 @@ class OpenAIBackendAPI:
         started_at = time.monotonic()
         attempt = 0
         interval = float(config.image_poll_interval_secs)
+        fast_mode = not config.image_check_before_hit_enabled and not config.image_settle_enabled
         initial_wait = float(config.image_poll_initial_wait_secs)
+        if fast_mode:
+            initial_wait = min(initial_wait, 0.5)
         file_ids: list[str] = []
         sediment_ids: list[str] = []
         self._add_unique(file_ids, initial_file_ids or [])
@@ -2925,6 +3071,7 @@ class OpenAIBackendAPI:
             return True
 
         last_task_error = ""
+        last_task_probe_at: float | None = None
         pending_task_failure: ImageFailure | None = None
         task_probe_failure: ImageFailure | None = None
         task_probe_error: Exception | None = None
@@ -2971,88 +3118,13 @@ class OpenAIBackendAPI:
             attempt += 1
             task_count = 0
             task_check_ok = False
-            task_query_started = time.perf_counter()
-            try:
-                tasks = self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=5.0)
-                task_count = len(tasks)
-                task_check_ok = True
-                task_probe_failure = None
-                task_probe_error = None
-                for task in tasks:
-                    candidate_failure = classify_task_failure(task)
-                    if candidate_failure is None:
-                        continue
-                    error_msg, metadata = self.image_task_diagnostics(task)
-                    candidate_error = error_msg or (
-                        candidate_failure.raw_detail
-                        if isinstance(candidate_failure.raw_detail, str)
-                        else ""
-                    )
-                    if candidate_error:
-                        candidate_failure = candidate_failure.with_raw_detail(candidate_error)
-                    pending_task_failure = merge_message_failure(
-                        pending_task_failure,
-                        candidate_failure,
-                    )
-                    if pending_task_failure is not None:
-                        detail = pending_task_failure.raw_detail
-                        last_task_error = detail if isinstance(detail, str) else last_task_error
-                    logger.info({
-                        "event": "image_poll_task_failure",
-                        "conversation_id": conversation_id,
-                        "attempt": attempt,
-                        "failure_code": candidate_failure.code,
-                        "error_msg": diagnostic_excerpt(candidate_error, 1000),
-                        "metadata": metadata,
-                    })
-            except (UpstreamHTTPError, requests.exceptions.RequestException) as exc:
-                task_probe_failure = classify_image_exception(exc)
-                task_probe_error = exc
-                logger.warning({
-                    "event": "image_poll_task_check_failed",
-                    "conversation_id": conversation_id,
-                    "attempt": attempt,
-                    "failure_code": task_probe_failure.code,
-                    "status_code": task_probe_failure.status_code,
-                    "error": diagnostic_excerpt(exc, 300),
-                })
-                if task_probe_failure.capability == "auth":
-                    setattr(exc, "failure", task_probe_failure)
-                    if file_ids or sediment_ids:
-                        try:
-                            self._schedule_auth_recovery("image_task_probe_after_success")
-                        except Exception as recovery_exc:
-                            logger.warning({
-                                "event": "image_auth_recovery_schedule_failed",
-                                "source": "image_task_probe_after_success",
-                                "conversation_id": conversation_id,
-                                "error": diagnostic_excerpt(recovery_exc, 300),
-                            })
-                        return file_ids, sediment_ids
-                    _raise_final_failure(
-                        task_probe_failure,
-                        raw_detail=str(exc),
-                        source_error=exc,
-                        upstream_error=str(exc),
-                    )
-            except Exception as exc:
-                # tasks 查询失败不影响正常轮询流程
-                logger.debug({
-                    "event": "image_poll_task_check_failed",
-                    "conversation_id": conversation_id,
-                    "attempt": attempt,
-                    "error": diagnostic_excerpt(exc, 300),
-                })
-            finally:
-                self._add_image_result_timing(
-                    "poll_request_ms",
-                    (time.perf_counter() - task_query_started) * 1000,
-                )
-
+            task_probe_attempted = False
             conversation_query_started = time.perf_counter()
             try:
                 try:
-                    conversation = self._get_conversation(conversation_id)
+                    conversation = self._get_conversation(
+                        conversation_id, timeout_secs=min(10.0, _remaining()),
+                    )
                 finally:
                     self._add_image_result_timing(
                         "poll_request_ms",
@@ -3061,7 +3133,9 @@ class OpenAIBackendAPI:
             except UpstreamHTTPError as exc:
                 failure = classify_image_exception(exc)
                 setattr(exc, "failure", failure)
-                if failure.retryable:
+                # This GET only observes the existing task. A transient 429
+                # after early polling must honor Retry-After, never regenerate.
+                if failure.retryable or exc.status_code == 429:
                     conversation_transport_failure = failure
                     conversation_transport_error = exc
                     if _retry_sleep("upstream_status", exc.status_code, None, exc.retry_after):
@@ -3104,6 +3178,81 @@ class OpenAIBackendAPI:
                     if sediment_id not in sediment_ids:
                         sediment_ids.append(sediment_id)
 
+            if _remaining() <= 0 and not (file_ids or sediment_ids):
+                break
+            if not (file_ids or sediment_ids) and (
+                last_task_probe_at is None or time.monotonic() - last_task_probe_at >= 5.0
+            ):
+                last_task_probe_at = time.monotonic()
+                task_probe_attempted = True
+                task_query_started = time.perf_counter()
+                try:
+                    tasks = self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=min(5.0, _remaining()))
+                    task_count = len(tasks)
+                    task_check_ok = True
+                    task_probe_failure = None
+                    task_probe_error = None
+                    for task in tasks:
+                        candidate_failure = classify_task_failure(task)
+                        if candidate_failure is None:
+                            continue
+                        error_msg, metadata = self.image_task_diagnostics(task)
+                        candidate_error = error_msg or (
+                            candidate_failure.raw_detail
+                            if isinstance(candidate_failure.raw_detail, str)
+                            else ""
+                        )
+                        if candidate_error:
+                            candidate_failure = candidate_failure.with_raw_detail(candidate_error)
+                        pending_task_failure = merge_message_failure(
+                            pending_task_failure,
+                            candidate_failure,
+                        )
+                        if pending_task_failure is not None:
+                            detail = pending_task_failure.raw_detail
+                            last_task_error = detail if isinstance(detail, str) else last_task_error
+                        logger.info({
+                            "event": "image_poll_task_failure",
+                            "conversation_id": conversation_id,
+                            "attempt": attempt,
+                            "failure_code": candidate_failure.code,
+                            "error_msg": diagnostic_excerpt(candidate_error, 1000),
+                            "metadata": metadata,
+                        })
+                except (UpstreamHTTPError, requests.exceptions.RequestException) as exc:
+                    task_probe_failure = classify_image_exception(exc)
+                    task_probe_error = exc
+                    logger.warning({
+                        "event": "image_poll_task_check_failed",
+                        "conversation_id": conversation_id,
+                        "attempt": attempt,
+                        "failure_code": task_probe_failure.code,
+                        "status_code": task_probe_failure.status_code,
+                        "error": diagnostic_excerpt(exc, 300),
+                    })
+                    if task_probe_failure.capability == "auth":
+                        setattr(exc, "failure", task_probe_failure)
+                        _raise_final_failure(
+                            task_probe_failure,
+                            raw_detail=str(exc),
+                            source_error=exc,
+                            upstream_error=str(exc),
+                        )
+                except Exception as exc:
+                    # tasks 查询失败不影响正常轮询流程
+                    logger.debug({
+                        "event": "image_poll_task_check_failed",
+                        "conversation_id": conversation_id,
+                        "attempt": attempt,
+                        "error": diagnostic_excerpt(exc, 300),
+                    })
+                finally:
+                    self._add_image_result_timing(
+                        "poll_request_ms",
+                        (time.perf_counter() - task_query_started) * 1000,
+                    )
+
+
             if not file_ids and not sediment_ids:
                 conversation_failure = classify_conversation_failure(conversation)
                 failure = merge_message_failure(pending_task_failure, conversation_failure)
@@ -3138,8 +3287,9 @@ class OpenAIBackendAPI:
                         ),
                     )
 
-            logger.debug({"event": "image_poll_check", "conversation_id": conversation_id, "attempt": attempt,
-                          "file_ids": file_ids, "sediment_ids": sediment_ids})
+            logger.info({"event": "image_poll_check", "conversation_id": conversation_id, "attempt": attempt,
+                         "task_probe_attempted": task_probe_attempted,
+                         "file_ids": file_ids, "sediment_ids": sediment_ids})
             if file_ids or sediment_ids:
                 if not config.image_check_before_hit_enabled:
                     # 先check再hit 机制关闭：直接返回首次发现的 file_ids
@@ -3167,7 +3317,8 @@ class OpenAIBackendAPI:
                 return file_ids, sediment_ids
             logger.debug({"event": "image_poll_wait", "conversation_id": conversation_id,
                           "elapsed_secs": round(time.monotonic() - started_at, 1)})
-            wait = min(interval, max(0.0, _remaining()))
+            poll_interval = min(interval, min(2.0, float(attempt))) if fast_mode else interval
+            wait = min(poll_interval, max(0.0, _remaining()))
             if wait > 0:
                 self._sleep_for_image_poll(wait)
         timeout_failure = image_failure("image_poll_timeout")
@@ -3304,6 +3455,7 @@ class OpenAIBackendAPI:
         urls: list[str] = []
         resolution_errors: list[tuple[ImageFailure, Exception]] = []
         skip_patterns = {"file_upload"}
+        resolved_asset_ids: set[str] = set()
 
         def resolve_candidate(
                 source: str,
@@ -3351,6 +3503,7 @@ class OpenAIBackendAPI:
                     resolution_errors.append((failure, exc))
                     return ""
                 if url:
+                    self.__dict__.setdefault("_image_resolved_assets", {})[url] = asset_id
                     return url
                 logger.warning({
                     "event": (
@@ -3374,7 +3527,7 @@ class OpenAIBackendAPI:
             return ""
 
         for file_id in file_ids:
-            if file_id in skip_patterns:
+            if file_id in skip_patterns or file_id in resolved_asset_ids:
                 logger.debug({
                     "event": "image_file_id_skipped",
                     "source": "file",
@@ -3388,10 +3541,16 @@ class OpenAIBackendAPI:
                 lambda file_id=file_id: self._get_file_download_url(file_id),
             )
             if url:
+                resolved_asset_ids.add(file_id)
                 if url not in urls:
                     urls.append(url)
         if conversation_id:
             for sediment_id in sediment_ids:
+                # SSE can expose the same output through both file and sediment
+                # pointers. Keep attachment lookup as a fallback, not a second
+                # mandatory request after the file endpoint already succeeded.
+                if sediment_id in skip_patterns or sediment_id in resolved_asset_ids:
+                    continue
                 url = resolve_candidate(
                     "sediment",
                     sediment_id,
@@ -3400,8 +3559,10 @@ class OpenAIBackendAPI:
                         sediment_id,
                     ),
                 )
-                if url and url not in urls:
-                    urls.append(url)
+                if url:
+                    resolved_asset_ids.add(sediment_id)
+                    if url not in urls:
+                        urls.append(url)
         logger.debug({
             "event": "image_urls_resolved",
             "conversation_id": conversation_id,
@@ -3455,6 +3616,7 @@ class OpenAIBackendAPI:
         file_ids = [item for item in file_ids if item != "file_upload"]
         sediment_ids = list(sediment_ids)
         timeout = poll_timeout_secs if poll_timeout_secs is not None else config.image_poll_timeout_secs
+        direct_resolve_timing: dict[str, int] = {}
         # 当 check-before-hit 和 settle 均已关闭，且 SSE 已给出 file_ids 时，
         # 跳过轮询直接解析 URL，省去 initial_wait + 轮询耗时。
         if poll and conversation_id and (file_ids or sediment_ids):
@@ -3465,7 +3627,25 @@ class OpenAIBackendAPI:
                     "file_ids": file_ids,
                     "sediment_ids": sediment_ids,
                 })
-                return self._resolve_image_urls_with_timing(conversation_id, file_ids, sediment_ids)
+                try:
+                    urls = self._resolve_image_urls_with_timing(conversation_id, file_ids, sediment_ids)
+                except Exception as exc:
+                    failure = classify_image_exception(exc)
+                    if failure.capability == "auth" or not (
+                        isinstance(exc, ImageDownloadError) or failure.retryable
+                    ):
+                        raise
+                    logger.info({
+                        "event": "image_direct_resolve_pending",
+                        "conversation_id": conversation_id,
+                        "failure_code": failure.code,
+                    })
+                else:
+                    if urls:
+                        return urls
+                # The existing poller resets its own counters. Preserve the
+                # fast-path attempt so fallback latency stays fully observable.
+                direct_resolve_timing = self.pop_image_result_timing()
         if poll and conversation_id:
             logger.info({
                 "event": "image_resolve_poll_needed",
@@ -3507,6 +3687,9 @@ class OpenAIBackendAPI:
             else:
                 file_ids.extend(item for item in polled_file_ids if item and item not in file_ids)
                 sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
+            finally:
+                for key, value in direct_resolve_timing.items():
+                    self._add_image_result_timing(key, value)
         return self._resolve_image_urls_with_timing(conversation_id, file_ids, sediment_ids)
 
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
@@ -3613,6 +3796,9 @@ class OpenAIBackendAPI:
     ) -> Iterator[str]:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
+        self.image_route_observation = {"requested_model": model, "upstream_model": self._image_model_slug(model)}
+        self._image_asset_observations = {}
+        self._image_resolved_assets = {}
         self._report_progress("uploading")
         references = [self._upload_image(image, f"image_{idx}.png") for idx, image in enumerate(images, start=1)]
         self._report_progress("bootstrapping")
@@ -3630,6 +3816,7 @@ class OpenAIBackendAPI:
                 max_duration_secs=config.image_stream_timeout_secs,
                 timing_key="image_generation_stream",
             ):
+                self._observe_image_route(payload)
                 yield payload
                 if self._is_image_stream_terminal_payload(payload):
                     logger.info({
@@ -3669,9 +3856,12 @@ class OpenAIBackendAPI:
             )
 
         base = "/backend-api/sentinel/chat-requirements" if self.access_token else "/backend-anon/sentinel/chat-requirements"
+        started = time.perf_counter()
         p_token = build_legacy_requirements_token(self.user_agent, self.pow_script_sources, self.pow_data_build)
+        compute_ms = int((time.perf_counter() - started) * 1000)
 
         prepare_path = base + "/prepare"
+        prepare_started = time.perf_counter()
         response = self.session.post(
             self.base_url + prepare_path,
             headers=self._headers(prepare_path, {"Content-Type": "application/json"}),
@@ -3680,6 +3870,8 @@ class OpenAIBackendAPI:
         )
         ensure_ok(response, "chat_requirements_prepare")
         prepare_data = response.json()
+        prepare_ms = int((time.perf_counter() - prepare_started) * 1000)
+        solve_started = time.perf_counter()
 
         if (prepare_data.get("arkose") or {}).get("required"):
             raise RuntimeError("chat requirements requires arkose token, which is not implemented")
@@ -3701,6 +3893,8 @@ class OpenAIBackendAPI:
             turnstile_token = solve_turnstile_token(turnstile_info["dx"], p_token) or ""
 
         finalize_path = base + "/finalize"
+        compute_ms += int((time.perf_counter() - solve_started) * 1000)
+        finalize_started = time.perf_counter()
         response = self.session.post(
             self.base_url + finalize_path,
             headers=self._headers(finalize_path, {"Content-Type": "application/json"}),
@@ -3713,6 +3907,9 @@ class OpenAIBackendAPI:
         )
         ensure_ok(response, "chat_requirements_finalize")
         data = response.json()
+        logger.info({"event": "chat_requirements_timing", "prepare_ms": prepare_ms,
+                     "compute_ms": compute_ms,
+                     "finalize_ms": int((time.perf_counter() - finalize_started) * 1000)})
 
         token = data.get("token", "")
         if not token:

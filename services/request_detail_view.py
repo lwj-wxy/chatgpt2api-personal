@@ -8,8 +8,8 @@ from typing import Any, Mapping
 _TIMELINE_CATEGORIES = (
     ("entry", "入口与账号"),
     ("prepare", "上游准备"),
-    ("upstream", "上游生成"),
-    ("resolve", "结果处理"),
+    ("upstream", "上游生成与就绪"),
+    ("resolve", "结果交付准备"),
     ("download", "图片下载"),
 )
 
@@ -17,8 +17,10 @@ _TIMELINE_STEPS = (
     ("handler_queue_ms", "等待入口", "entry", "run_in_threadpool"),
     ("stream_first_queue_ms", "读取首包", "entry", "首个响应事件"),
     ("account_wait_ms", "等待账号", "entry", "账号池筛选"),
+    ("account_preflight_retry_ms", "账号预检回退", "entry", "故障出口等待；已包含在等待账号总耗时中"),
     ("egress_wait_ms", "等待出口", "entry", "代理出口准备"),
     ("egress_acquire_ms", "出口租约", "entry", "代理节点并发"),
+    ("egress_retry_ms", "连接失败与回退", "prepare", "提交生成前的失败连接耗时；不代表重复生成"),
     ("upload_ms", "上传输入图", "prepare", "参考图上传"),
     ("bootstrap_ms", "预热页面", "prepare", "ChatGPT 页面"),
     ("requirements_ms", "获取请求令牌", "prepare", "requirements / token"),
@@ -33,11 +35,11 @@ _TIMELINE_STEPS = (
     ("sse_first_event_ms", "SSE 首事件", "upstream", "首个 data 事件"),
     ("sse_max_gap_ms", "SSE 最大空窗", "upstream", "两次事件最大间隔"),
     ("sse_last_gap_ms", "SSE 收尾空窗", "upstream", "最后事件到关闭"),
-    ("conversation_stream_ms", "上游生成", "upstream", "ChatGPT 会话流"),
+    ("conversation_stream_ms", "会话阶段总耗时", "upstream", "包含上传、初始化及会话流；不代表图片已就绪"),
     ("stream_error_ms", "上游断流", "upstream", "HTTP2 / SSE"),
-    ("poll_wait_ms", "等待结果", "resolve", "首次等待 / 轮询间隔 / 退避"),
-    ("poll_request_ms", "查询结果", "resolve", "task / conversation"),
-    ("resolve_ms", "解析结果", "resolve", "file ID / 下载地址"),
+    ("poll_wait_ms", "等待上游结果", "upstream", "轮询间隔 / 退避；上游图片可能仍在生成"),
+    ("poll_request_ms", "查询上游结果", "upstream", "会话 / 按需任务查询；包含网络等待"),
+    ("resolve_ms", "获取下载地址", "resolve", "图片文件 ID 对应的下载地址；包含上游请求"),
     ("response_ms", "响应整理", "resolve", "Codex 响应"),
     ("download_ms", "下载图片", "download", "图片文件下载"),
 )
@@ -45,20 +47,19 @@ _TIMELINE_STEPS = (
 _TIMELINE_SEGMENTS = (
     ("entry_queue", "入口排队", "entry", ("handler_queue_ms", "stream_first_queue_ms")),
     ("account_egress", "账号与出口", "entry", ("account_wait_ms", "egress_wait_ms")),
+    ("preflight_retry", "账号预检回退", "entry", ("account_preflight_retry_ms",)),
+    ("egress_retry", "连接失败与回退", "prepare", ("egress_retry_ms",)),
     (
         "prepare",
         "上游准备",
         "prepare",
         ("upload_ms", "bootstrap_ms", "requirements_ms", "prepare_conversation_ms"),
     ),
-    ("upstream", "上游生成", "upstream", ("generation_start_ms", "sse_stream_ms")),
-    ("poll_wait", "等待结果", "resolve", ("poll_wait_ms",)),
-    (
-        "query_resolve",
-        "查询与解析",
-        "resolve",
-        ("poll_request_ms", "resolve_ms", "response_ms"),
-    ),
+    ("upstream", "上游会话响应", "upstream", ("generation_start_ms", "sse_stream_ms")),
+    ("poll_wait", "等待上游结果", "upstream", ("poll_wait_ms",)),
+    ("poll_query", "查询上游结果", "upstream", ("poll_request_ms",)),
+    ("query_resolve", "获取下载地址", "resolve", ("resolve_ms",)),
+    ("response", "响应整理", "resolve", ("response_ms",)),
     ("download", "图片下载", "download", ("download_ms",)),
 )
 
@@ -280,6 +281,8 @@ def _timeline_segment_value(
     aggregate_keys: tuple[str, ...],
 ) -> int:
     primary_value = sum(_int(timings.get(key)) for key in aggregate_keys)
+    if segment_key == "account_egress":
+        return primary_value - min(_int(timings.get("account_wait_ms")), _int(timings.get("account_preflight_retry_ms")))
     if segment_key != "upstream":
         return primary_value
     envelope_value = _int(timings.get("conversation_stream_ms")) or _int(timings.get("stream_error_ms"))
@@ -419,13 +422,26 @@ def build_request_detail_core(
 ) -> dict[str, Any]:
     request_meta = _record(detail.get("request_meta"))
     resolutions = request_image_resolutions(detail)
+    raw_images = detail.get("result_images")
+    images = [image for image in raw_images if isinstance(image, Mapping)] if isinstance(raw_images, list) else []
+    is_image = bool(images or request_meta.get("size") or request_meta.get("quality") or "image" in _clean(summary.get("model")))
+    def facts(key: str) -> str:
+        return " · ".join(dict.fromkeys(_clean(image.get(key)) or "未知" for image in images)) or "未知"
+    source_sizes = [f'{image["source_width"]}×{image["source_height"]}' if image.get("source_width") and image.get("source_height") else "未知" for image in images]
     primary_candidates = [
         request_detail_field("请求 ID", detail.get("call_id") or summary.get("id"), copyable=True),
         request_detail_field("接口", summary.get("endpoint"), copyable=True),
-        request_detail_field("模型", summary.get("model"), copyable=True),
+        request_detail_field("请求模型" if is_image else "模型", summary.get("model"), copyable=True),
+        request_detail_field("上游会话入口", facts("upstream_model")) if is_image else None,
+        request_detail_field("请求图片工具模型", facts("requested_tool_model")) if any(image.get("requested_tool_model") for image in images) else None,
+        request_detail_field("返回会话模型", facts("reported_conversation_model")) if is_image else None,
+        request_detail_field("实际图片模型", facts("actual_image_model")) if is_image else None,
         request_detail_field("请求尺寸", request_meta.get("size")),
-        request_detail_field("实际分辨率", resolutions),
+        request_detail_field("原始图片尺寸", source_sizes or "未知") if is_image else None,
+        request_detail_field("交付图片尺寸", resolutions),
         request_detail_field("请求质量", request_meta.get("quality")),
+        request_detail_field("上游实际质量", facts("actual_quality")) if is_image else None,
+        request_detail_field("尺寸后处理", " · ".join(dict.fromkeys({"none": "未调整", "resize": "本地缩放"}.get(_clean(image.get("postprocess")), "未知") for image in images)) or "未知") if is_image else None,
         request_detail_field("返回格式", request_meta.get("response_format")),
         request_detail_field("请求张数", request_meta.get("n")),
         request_detail_field("出图张数", len(resolutions) if resolutions else None),

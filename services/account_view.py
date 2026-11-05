@@ -3,12 +3,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from services.account_credentials import project_upstream_credential_availability
+from services.account_credentials import access_token_has_invalid_format, project_upstream_credential_availability
 from services.proxy_management_service import project_proxy_assignment
 from utils.diagnostics import sanitize_diagnostic_text
 
 
-AccountStatusCategory = Literal["normal", "limited", "abnormal", "disabled"]
+AccountStatusCategory = Literal["normal", "unverified", "limited", "abnormal", "disabled"]
 PresentationTone = Literal["neutral", "success", "warning", "error", "info"]
 
 _STATUS_CATEGORY: dict[str, AccountStatusCategory] = {
@@ -20,6 +20,7 @@ _STATUS_CATEGORY: dict[str, AccountStatusCategory] = {
 
 _STATUS_LABEL: dict[AccountStatusCategory, str] = {
     "normal": "正常",
+    "unverified": "待验证",
     "limited": "限流",
     "abnormal": "异常",
     "disabled": "禁用",
@@ -27,6 +28,7 @@ _STATUS_LABEL: dict[AccountStatusCategory, str] = {
 
 _STATUS_TONE: dict[AccountStatusCategory, PresentationTone] = {
     "normal": "success",
+    "unverified": "warning",
     "limited": "warning",
     "abnormal": "error",
     "disabled": "neutral",
@@ -101,6 +103,8 @@ def _credential_lifecycle(account: dict[str, Any]) -> dict[str, Any]:
     access = availability.access
     refresh_status = availability.refresh_status
     access_label, access_tone = _ACCESS_TOKEN_PRESENTATION[access.status]
+    if access_token_has_invalid_format(access_token):
+        access_label = "AT 格式错误"
     refresh_label, refresh_tone = _REFRESH_TOKEN_PRESENTATION[refresh_status]
     availability_label, availability_tone = _CREDENTIAL_AVAILABILITY_PRESENTATION[availability.status]
     return {
@@ -157,11 +161,14 @@ def _backend_status_category(account: dict[str, Any]) -> AccountStatusCategory:
 def _effective_status_category(
     backend_category: AccountStatusCategory,
     credential_lifecycle: dict[str, Any],
+    remote_result: str,
 ) -> AccountStatusCategory:
     if backend_category in {"disabled", "abnormal"}:
         return backend_category
     if credential_lifecycle["credential_availability"] == "unavailable":
         return "abnormal"
+    if remote_result in {"error", "pending"}:
+        return "unverified"
     return backend_category
 
 
@@ -170,8 +177,8 @@ def _status(
     credential_lifecycle: dict[str, Any],
 ) -> tuple[AccountStatusCategory, str, PresentationTone, str, str, str]:
     backend_category = _backend_status_category(account)
-    category = _effective_status_category(backend_category, credential_lifecycle)
     remote_result = _text(account.get("last_remote_check_result")).lower()
+    category = _effective_status_category(backend_category, credential_lifecycle, remote_result)
     raw_error = _diagnostic(
         (
             account.get("last_remote_check_error")
@@ -183,15 +190,19 @@ def _status(
 
     if backend_category == "disabled":
         reason_code, reason = "disabled", "账号已手动禁用"
+    elif category == "abnormal" and access_token_has_invalid_format(account.get("access_token")):
+        reason_code, reason = "access_token_format_invalid", "AT 格式不合法，请重新录入 Access Token；当前凭据不能参与调度"
     elif backend_category == "abnormal":
         reason_code, reason = "auth_invalid", "远程确认账号登录态已失效"
     elif category == "abnormal":
         reason_code, reason = "credentials_unavailable", "AT 已失效，且没有可用 RT，账号无法参与调度"
-    elif backend_category == "limited":
-        reason_code, reason = "image_quota_exhausted", "远程确认图片额度已用完"
     elif remote_result == "pending":
         reason_code, reason = "verification_pending", "正在核验账号状态"
-    elif remote_result == "error" or raw_error:
+    elif remote_result == "error":
+        reason_code, reason = "remote_check_failed", "最近一次账号检测失败，尚未确认账号失效"
+    elif backend_category == "limited":
+        reason_code, reason = "image_quota_exhausted", "远程确认图片额度已用完"
+    elif raw_error:
         reason_code, reason = "remote_check_failed", "最近一次账号检测失败，尚未确认账号失效"
     elif credential_lifecycle["credential_availability"] == "recoverable":
         reason_code, reason = "access_token_refresh_required", "AT 已失效，将使用 RT 自动刷新"
@@ -213,6 +224,7 @@ def account_status_category(account: dict[str, Any]) -> AccountStatusCategory:
     return _effective_status_category(
         _backend_status_category(account),
         _credential_lifecycle(account),
+        _text(account.get("last_remote_check_result")).lower(),
     )
 
 

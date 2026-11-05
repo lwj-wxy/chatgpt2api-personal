@@ -81,6 +81,7 @@ export function useAccountsPage() {
   const statusFilterOptions = [
     { label: '全部状态', value: 'all' },
     { label: '正常', value: 'normal' },
+    { label: '待验证', value: 'unverified' },
     { label: '限流', value: 'limited' },
     { label: '异常', value: 'abnormal' },
     { label: '禁用', value: 'disabled' },

@@ -10,10 +10,11 @@ from contracts.models import (
     ModelCatalogDefaults,
     ModelCatalogSource,
     ModelCatalogView,
+    ImageModelProfile,
 )
 from services.account_service import account_service
 from services.config import config
-from utils.helper import CODEX_IMAGE_MODEL, WEB_IMAGE_MODELS
+from utils.helper import CODEX_IMAGE_MODEL, WEB_IMAGE_MODELS, image_model_route, is_codex_image_model
 
 
 FALLBACK_CHAT_MODELS = [
@@ -22,6 +23,45 @@ FALLBACK_CHAT_MODELS = [
 ]
 
 FALLBACK_IMAGE_MODELS = list(WEB_IMAGE_MODELS)
+
+_IMAGE_SIZES = (
+    ("auto", "auto", "auto"),
+    ("1024x1024", "1:1", "1K"), ("1024x1536", "2:3", "1K"), ("1536x1024", "3:2", "1K"),
+    ("1008x1344", "3:4", "1K"), ("1344x1008", "4:3", "1K"),
+    ("864x1536", "9:16", "1K"), ("1536x864", "16:9", "1K"),
+    ("2048x2048", "1:1", "2K"), ("1536x2304", "2:3", "2K"), ("2304x1536", "3:2", "2K"),
+    ("1536x2048", "3:4", "2K"), ("2048x1536", "4:3", "2K"),
+    ("2560x1440", "16:9", "2K"), ("1440x2560", "9:16", "2K"),
+    ("2880x2880", "1:1", "4K"), ("3840x2160", "16:9", "4K"), ("2160x3840", "9:16", "4K"),
+    ("3456x2304", "3:2", "4K"), ("2304x3456", "2:3", "4K"),
+    ("3264x2448", "4:3", "4K"), ("2448x3264", "3:4", "4K"),
+)
+
+
+def image_model_profile(model: str, upscale: bool = False) -> ImageModelProfile:
+    codex = is_codex_image_model(model)
+    alias = model.startswith("gpt-image-2.5")
+    note = (
+        "尺寸和质量通过工具参数提交；上游未报告时，实际图片模型与质量显示未知。"
+        if codex else
+        "尺寸和质量为提示词目标，实际以返回图片为准；当前无法保证独立选择 Flare / Sunburst。"
+    )
+    if upscale:
+        note += "已启用本地尺寸放大，日志会区分原始与交付尺寸。"
+    return ImageModelProfile(
+        model=model, label=model + ("（兼容入口）" if alias else ""),
+        selection_mode="tool_model" if codex else "compatibility_alias" if alias else "conversation_tool",
+        upstream_model=image_model_route(model), image_model_verified=False,
+        size_mode="native_parameter" if codex else "prompt_hint",
+        quality_mode="native_parameter" if codex else "prompt_hint", note=note,
+        size_label="请求尺寸" if codex else "目标尺寸（尽量遵循）",
+        quality_label="请求质量" if codex else "目标质量（尽量遵循）",
+        size_options=tuple({"value": value, "ratio": ratio, "resolution": resolution,
+                            "label": "自动" if value == "auto" else f"{ratio} · {resolution} · {value}"}
+                           for value, ratio, resolution in _IMAGE_SIZES),
+        quality_options=tuple({"value": value, "label": label} for value, label in
+                              (("auto", "自动"), ("low", "低"), ("medium", "中"), ("high", "高"))),
+    )
 
 
 def _normalize_list(raw: object) -> list[str]:
@@ -147,12 +187,14 @@ class ModelCatalogService:
             "high_resolution_image_models": high_resolution_models,
         }
         source = {"chat": chat_source, "image": image_source}
+        profiles = tuple(image_model_profile(model, bool(settings.get("image_upscale_enabled"))) for model in image_models)
         revision_payload = {
             "chat_models": chat_models,
             "image_models": image_models,
             "defaults": defaults,
             "capabilities": capabilities,
             "source": source,
+            "image_profiles": [p.model_dump(mode="json") for p in profiles],
         }
 
         return ModelCatalogView(
@@ -167,6 +209,7 @@ class ModelCatalogService:
                 high_resolution_image_models=tuple(high_resolution_models),
             ),
             source=ModelCatalogSource(**source),
+            image_profiles=profiles,
         )
 
 

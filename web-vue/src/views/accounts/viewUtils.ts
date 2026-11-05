@@ -1,6 +1,6 @@
-import type { Account, AccountGroup, AccountLane } from '@/api/accounts'
+import type { Account, AccountGroup, AccountLane, AccountStatusCategory } from '@/api/accounts'
 
-export type AccountStatusFilter = 'all' | 'normal' | 'limited' | 'abnormal' | 'disabled'
+export type AccountStatusFilter = 'all' | AccountStatusCategory
 export type AccountStatusTone = 'neutral' | 'success' | 'warning' | 'error'
 
 export type AccountGroupRow = AccountGroup & {

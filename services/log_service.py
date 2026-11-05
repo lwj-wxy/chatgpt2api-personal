@@ -46,6 +46,7 @@ INTERNAL_RESPONSE_KEYS = {
     "_image_urls",
     "_image_attempts",
     "_image_metadata",
+    "_generation",
 }
 LOG_IMAGE_URL_RE = re.compile(r"(?:!\[[^\]]*\]\()(?P<url>(?:https?://|/images/|/image-thumbnails/)[^\s)\"']+)\)")
 PERF_WAIT_WARN_MS = 1000

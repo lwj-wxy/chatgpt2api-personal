@@ -10,12 +10,12 @@ from services.protocol.conversation import (
     ConversationRequest,
     ImageGenerationError,
     collect_image_outputs,
-    count_text_tokens,
+    prepare_image_input_usage,
     encode_images,
     stream_image_chunks,
     stream_image_outputs_with_pool,
 )
-from utils.image_tokens import count_image_inputs_tokens, count_image_output_items_tokens, image_usage
+from utils.image_tokens import count_image_output_items_tokens, image_usage
 
 
 def _composite_mask(
@@ -67,6 +67,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
             "image is required",
             failure=image_failure("invalid_image_input"),
         )
+    input_usage = prepare_image_input_usage(prompt, model, images)
     outputs = stream_image_outputs_with_pool(ConversationRequest(
         prompt=prompt,
         model=model,
@@ -82,22 +83,18 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         trace_image_perf=bool(body.get("_trace_image_perf")),
     ))
     if body.get("stream"):
-        input_text_tokens = count_text_tokens(prompt, model)
-        input_image_tokens = count_image_inputs_tokens(images, model)
         return stream_image_chunks(
             outputs,
             event_prefix="image_edit",
             partial_images=body.get("partial_images"),
             usage_builder=lambda data: image_usage(
-                input_text_tokens=input_text_tokens,
-                input_image_tokens=input_image_tokens,
+                **input_usage(),
                 output_tokens=count_image_output_items_tokens(data, size, quality),
             ),
         )
     result = collect_image_outputs(outputs, result_callback=body.get("_image_result_callback"))
     result["usage"] = image_usage(
-        input_text_tokens=count_text_tokens(prompt, model),
-        input_image_tokens=count_image_inputs_tokens(images, model),
+        **input_usage(),
         output_tokens=count_image_output_items_tokens(result.get("data"), size, quality),
     )
     return result

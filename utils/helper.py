@@ -20,13 +20,16 @@ from utils.log import logger
 
 WEB_IMAGE_MODELS = (
     "gpt-image-2",
-    "gpt-image-2.5",
     "gpt-image-2.5-flare",
     "gpt-image-2.5-sunburst",
+    "gpt-image-2.6-flare",
+    "gpt-image-2.6-sunburst",
 )
 BASE_IMAGE_MODELS = {*WEB_IMAGE_MODELS, "codex-gpt-image-2"}
 IMAGE_MODEL_PLAN_TYPES = ("plus", "team", "pro")
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
+CODEX_RESPONSES_MODEL = "gpt-5.5"
+CODEX_RESPONSES_IMAGE_MODEL = "gpt-image-2"
 PREFIXED_CODEX_IMAGE_MODELS = {
     f"{plan_type}-{CODEX_IMAGE_MODEL}"
     for plan_type in IMAGE_MODEL_PLAN_TYPES
@@ -134,6 +137,25 @@ def split_image_model(model: object) -> tuple[str | None, str | None]:
 def is_supported_image_model(model: object) -> bool:
     _, base_model = split_image_model(model)
     return base_model is not None
+
+
+def image_model_route(model: object) -> str:
+    """Wire model for a route; this is not evidence of the image engine used."""
+    _, base_model = split_image_model(model)
+    if base_model == "gpt-image-2":
+        return "gpt-5-3"
+    if base_model == CODEX_IMAGE_MODEL:
+        return CODEX_RESPONSES_MODEL
+    return base_model if base_model in WEB_IMAGE_MODELS else "auto"
+
+
+def validate_image_parameters(size: object, quality: object) -> None:
+    if size not in (None, "", "auto"):
+        match = re.fullmatch(r"(\d{2,4})x(\d{2,4})", str(size))
+        if not match or not all(64 <= int(v) <= 8192 for v in match.groups()):
+            raise HTTPException(400, detail={"error": "size must be auto or WIDTHxHEIGHT (64–8192 pixels per side)"})
+    if quality not in ("auto", "low", "medium", "high", "hd"):
+        raise HTTPException(400, detail={"error": "quality must be auto, low, medium or high"})
 
 
 def is_codex_image_model(model: object) -> bool:

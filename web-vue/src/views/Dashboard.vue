@@ -28,7 +28,7 @@
 
     <section
       aria-label="账号概览"
-      class="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6"
+      class="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-7"
     >
       <StatCard
         v-for="stat in accountStats"

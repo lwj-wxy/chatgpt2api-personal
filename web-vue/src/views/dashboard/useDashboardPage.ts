@@ -188,6 +188,14 @@ export function useDashboardPage() {
         iconColor: 'text-emerald-600'
       },
       {
+        label: '待验证账号',
+        value: '0',
+        meta: '',
+        icon: 'lucide:clock',
+        iconBg: 'bg-amber-100',
+        iconColor: 'text-amber-600'
+      },
+      {
         label: '限流账号',
         value: '0',
         meta: '',
@@ -710,11 +718,12 @@ export function useDashboardPage() {
   function applyAccountStats(accounts: DashboardAccountStats) {
     stats.value[0].value = formatStatNumber(accounts.total)
     stats.value[1].value = formatStatNumber(accounts.active)
-    stats.value[2].value = formatStatNumber(accounts.limited)
-    stats.value[3].value = formatStatNumber(accounts.abnormal)
-    stats.value[4].value = formatStatNumber(accounts.disabled)
-    stats.value[5].value = formatStatNumber(accounts.total_quota)
-    stats.value[5].meta = ''
+    stats.value[2].value = formatStatNumber(accounts.unverified)
+    stats.value[3].value = formatStatNumber(accounts.limited)
+    stats.value[4].value = formatStatNumber(accounts.abnormal)
+    stats.value[5].value = formatStatNumber(accounts.disabled)
+    stats.value[6].value = formatStatNumber(accounts.total_quota)
+    stats.value[6].meta = ''
   }
 
   function applyTrendRangeToChartData(range: DashboardRangeStats) {
@@ -772,6 +781,7 @@ export function useDashboardPage() {
       accounts: [
         accounts.total,
         accounts.active,
+        accounts.unverified,
         accounts.limited,
         accounts.abnormal,
         accounts.disabled,

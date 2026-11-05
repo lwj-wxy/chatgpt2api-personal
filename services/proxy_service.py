@@ -19,6 +19,7 @@ from services.storage.configuration_repository import (
     ProxyConfigurationRepository,
     proxy_configuration_repository,
 )
+from utils.log import logger
 
 
 FlareSolverrRequestMethod = Callable[[str, bytes, dict[str, str], float], bytes]
@@ -251,6 +252,37 @@ class ProxySettingsStore:
         reserve_image_egress: bool = False,
         deadline_monotonic: float | None = None,
     ) -> ProxyRuntimeProfile:
+        try:
+            return self._get_profile(
+                account=account, proxy=proxy, resource=resource, upstream=upstream,
+                reserve_image_egress=reserve_image_egress,
+                deadline_monotonic=deadline_monotonic,
+            )
+        except ProxyReferenceUnavailableError:
+            fallback = self.get_fallback_profile(
+                resource=resource, upstream=upstream,
+                reserve_image_egress=reserve_image_egress,
+                deadline_monotonic=deadline_monotonic,
+            )
+            if fallback is None:
+                raise
+            logger.warning({
+                "event": "proxy_group_fallback",
+                "reason": "proxy_group_unavailable",
+                "fallback_source": fallback.proxy_source,
+                "egress_mode": fallback.egress_mode,
+            })
+            return fallback
+
+    def _get_profile(
+        self,
+        account: dict | None = None,
+        proxy: str = "",
+        resource: bool = False,
+        upstream: bool = False,
+        reserve_image_egress: bool = False,
+        deadline_monotonic: float | None = None,
+    ) -> ProxyRuntimeProfile:
         runtime = self._get_runtime_settings()
         clearance = dict(runtime.get("clearance") if isinstance(runtime.get("clearance"), dict) else {})
         runtime_enabled = bool(runtime.get("enabled"))
@@ -400,7 +432,8 @@ class ProxySettingsStore:
         reference = self.get_fallback_proxy_reference()
         if not reference:
             return None
-        profile = self.get_profile(
+        # Resolve the fallback once; a broken fallback group must not recurse.
+        profile = self._get_profile(
             account=None,
             proxy=reference,
             resource=resource,
