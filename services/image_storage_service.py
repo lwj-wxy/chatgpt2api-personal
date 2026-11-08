@@ -1051,6 +1051,9 @@ class ImageStorageService:
 
     @staticmethod
     def _compress_png(payload: bytes) -> bytes:
+        # Older releases saved GIF bytes under .png names; do not flatten them.
+        if payload[:6] in (b"GIF87a", b"GIF89a"):
+            return payload
         output = io.BytesIO()
         with Image.open(io.BytesIO(payload)) as image:
             image = ImageOps.exif_transpose(image)

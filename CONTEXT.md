@@ -18,6 +18,15 @@ _Avoid_: User Key, frontend-derived token state, login retention setting
 The set of upstream accounts eligible for selection under the current model, status, quota, and policy filters.
 _Avoid_: User pool
 
+**Account Verification Status**:
+The backend-derived management category of an Upstream Account. A failed or
+pending remote check is `unverified` (`待验证`), separate from normal, limited,
+abnormal and disabled. Disabled accounts and confirmed unusable credentials
+take precedence. This projection does not replace stored account status,
+credential lifecycle or the Account Pool selection policy.
+_Avoid_: Treating every check failure as credential revocation, treating a
+locally unexpired Access Token as a successful remote verification
+
 **Account Processing Concurrency**:
 The process-wide capacity limit shared by Upstream Account batch tasks. Remote maintenance, including AT renewal, account and quota synchronization, import verification, and background checks, consumes one slot per active account. A local atomic batch mutation, including import save, enable, disable, reset, delete, and group binding, consumes one slot for the complete batch.
 _Avoid_: Image generation concurrency, import batch size
@@ -92,6 +101,13 @@ _Avoid_: Default proxy, proxy runtime egress
 The backend projection of supported text and image models, defaults, and model-related capabilities.
 _Avoid_: A page-local model list
 
+**Image Generation Evidence**:
+Request-local facts distinguishing the requested model/parameters, conversation
+route, explicitly reported image engine/quality, and measured source/delivery
+dimensions. A compatibility name, conversation model or tool argument does not
+prove which image engine produced the result. Missing facts remain unknown.
+_Avoid_: Treating a requested alias as an observed image model
+
 **Prompt Source**:
 A configured upstream or bundled origin whose validated snapshot contributes items to the prompt library.
 _Avoid_: Prompt item
@@ -122,6 +138,10 @@ _Avoid_: A global repository for settings, logs, images, and task state
 - The default egress is exactly one **Proxy Reference**; **Proxy Session** behavior cannot replace it.
 - Multiple **Prompt Sources** contribute items to one **Prompt Library**.
 - The **Model Catalog** is consumed by Studio and shared control-panel surfaces.
+- Image resolution tiers share one target matrix with ToolOrbit; for 16:9 the
+  1K, 2K and 4K targets are 1536×864, 2560×1440 and 3840×2160. Web targets
+  remain prompt hints. Measured source and delivered pixels determine whether
+  the target was met; a tier selection does not establish native resolution.
 - The **Application Database** hosts separate repositories for durable structured control-plane data.
 - The **Account Repository** stores **Upstream Accounts** and **User Keys** only.
 - **Image Assets**, gallery metadata, **Image Tasks**, and live monitoring state do not belong to the **Application Database**.

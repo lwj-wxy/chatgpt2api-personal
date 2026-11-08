@@ -33,6 +33,8 @@ export function useStudioModelFormRuntime() {
   const imageModelOptions = computed(() => (
     catalog.value ? [...imageModels.value] : uniqueStrings([imageForm.model])
   ))
+  const imageProfiles = computed(() => catalog.value?.image_profiles || [])
+  const selectedProfile = computed(() => imageProfiles.value.find((profile) => profile.model === imageForm.model))
   const imageHighResolutionEnabled = computed(() => {
     const capabilities = catalog.value?.capabilities
     return Boolean(
@@ -65,8 +67,11 @@ export function useStudioModelFormRuntime() {
       imageForm.model = value.defaults.image_model
     }
   }, { immediate: true })
-  watch([() => imageForm.model, imageHighResolutionEnabled], ([, highResolutionEnabled]) => {
-    if (!isImageSizeSupportedByModel(imageForm.size, highResolutionEnabled)) imageForm.size = DEFAULT_IMAGE_SIZE
+  watch([selectedProfile, imageHighResolutionEnabled], ([profile, highResolutionEnabled]) => {
+    const supported = profile ? profile.size_options.some((option) => option.value === imageForm.size)
+      : isImageSizeSupportedByModel(imageForm.size, highResolutionEnabled)
+    if (!supported) imageForm.size = DEFAULT_IMAGE_SIZE
+    if (profile && !profile.quality_options.some((option) => option.value === imageForm.quality)) imageForm.quality = DEFAULT_IMAGE_QUALITY
   })
 
   return {
@@ -75,6 +80,7 @@ export function useStudioModelFormRuntime() {
     chatReasoningEffort,
     imageForm,
     imageModelOptions,
+    imageProfiles,
     imageHighResolutionEnabled,
     imageGifEnabled,
     imageMaxN,

@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from services.account_credentials import (
     ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+    access_token_has_invalid_format,
     access_token_expires_in_seconds,
     access_token_issued_at,
     decode_access_token_payload,
@@ -1119,7 +1120,7 @@ class AccountService:
 
     @classmethod
     def _token_needs_refresh(cls, access_token: str, *, force: bool = False) -> bool:
-        if force:
+        if force or access_token_has_invalid_format(access_token):
             return True
         remaining = cls._token_expires_in(access_token)
         return remaining is not None and remaining <= cls._ACCESS_TOKEN_REFRESH_SKEW_SECONDS
@@ -1863,7 +1864,7 @@ class AccountService:
             plan_types: set[str] | tuple[str, ...] | None = None,
     ) -> list[str]:
         max_concurrency = max(1, int(config.image_account_concurrency or 1))
-        return [
+        tokens = [
             token
             for token in self._list_ready_candidate_tokens(
                 excluded_tokens,
@@ -1873,6 +1874,14 @@ class AccountService:
             )
             if int(self._image_inflight.get(token, 0)) < max_concurrency
         ]
+        # Keep failed remote checks as recovery candidates, but do not make
+        # healthy idle accounts wait behind their repeated network failures.
+        # Every selected account still goes through fetch_remote_info.
+        preferred = [
+            token for token in tokens
+            if self._accounts[token].get("last_remote_check_result") != "error"
+        ]
+        return preferred or tokens
 
     def _acquire_next_candidate_token(
             self,
@@ -1998,12 +2007,15 @@ class AccountService:
             plan_types: set[str] | tuple[str, ...] | None = None,
             excluded_tokens: set[str] | None = None,
             deadline_monotonic: float | None = None,
+            image_preflight_context: dict[str, Any] | None = None,
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
         基于本地缓存做初筛，然后通过 fetch_remote_info 做远程验证（token 有效性、配额等）。
         限制最大尝试次数防止 token rotation 导致无限循环。
         """
+        if image_preflight_context is not None:
+            image_preflight_context.clear()
         self._refresh_accounts_snapshot_if_stale()
         if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
             raise ImageAccountSelectionError(
@@ -2040,10 +2052,12 @@ class AccountService:
                     "image request deadline exceeded before remote account validation",
                 )
             try:
+                candidate_context: dict[str, Any] = {}
                 account = self.fetch_remote_info(
                     access_token,
                     "get_available_access_token",
                     image_scope=True,
+                    **({"image_preflight_context": candidate_context} if image_preflight_context is not None else {}),
                 )
             except Exception:
                 # 预检失败（上游波动/网络/401 等）：这个号这次不可用，换下一个。
@@ -2073,6 +2087,8 @@ class AccountService:
                     and self._account_matches_any_plan_type(account or {}, plan_types)
                     and self._account_matches_source_type(account or {}, source_type)
             ):
+                if image_preflight_context is not None:
+                    image_preflight_context.update(candidate_context)
                 return str((account or {}).get("access_token") or access_token)
             if str((account or {}).get("status") or "") == "限流":
                 saw_remote_quota_exhausted = True
@@ -2389,8 +2405,7 @@ class AccountService:
             return [
                 token
                 for item in self._accounts.values()
-                if item.get("status") == "正常"
-                   and item.get("last_remote_check_result") != "pending"
+                if self._is_account_selectable(item, allow_limited=False)
                    and (token := item.get("access_token") or "")
             ]
 
@@ -3247,6 +3262,7 @@ class AccountService:
             )
             credentials_changed = next_access_token != access_token or refresh_token_changed
             if credentials_changed:
+                normalized_updates["last_full_remote_checked_at"] = None
                 self._scrub_diagnostic_secrets(
                     normalized_updates,
                     [
@@ -3348,6 +3364,16 @@ class AccountService:
         expected_remote_check_marker: _RemoteCheckMarker,
     ) -> dict | None:
         now = datetime.now(timezone.utc).isoformat()
+        updates = dict(updates)
+        image_preflight_only = bool(updates.pop("_image_preflight_only", False))
+        if image_preflight_only:
+            current = self.get_account(access_token) or {}
+            # Do not slide identity freshness forward on quota-only checks.
+            updates["last_full_remote_checked_at"] = (
+                current.get("last_full_remote_checked_at", current.get("last_remote_checked_at"))
+            )
+        else:
+            updates["last_full_remote_checked_at"] = now
         return self.update_account(
             access_token,
             {
@@ -4132,9 +4158,12 @@ class AccountService:
         image_scope: bool = False,
         allow_refresh_token_exchange: bool = True,
         preflight_refresh: bool = True,
+        image_preflight_context: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         if not access_token:
             raise ValueError("access_token is required")
+        if image_preflight_context is not None:
+            image_preflight_context.clear()
 
         if allow_refresh_token_exchange and preflight_refresh:
             refresh_kwargs = {"event": f"{event}:preflight"}
@@ -4148,7 +4177,7 @@ class AccountService:
         def request_user_info(token: str) -> dict[str, Any]:
             with account_processing_slot():
                 with OpenAIBackendAPI(token) as backend:
-                    return backend.get_user_info()
+                    return backend.get_user_info(image_scope=True) if image_scope else backend.get_user_info()
 
         request_token, request_refresh_token, request_account = self._credential_snapshot(active_token)
         if not request_account:
@@ -4318,6 +4347,10 @@ class AccountService:
             )
             raise
 
+        # Transport choices belong to this selection, never the Account Repository.
+        fallback_direct = bool(result.pop("_image_preflight_fallback_direct", False))
+        retry_ms = max(0, int(result.pop("_image_preflight_retry_ms", 0)))
+        preflight_context = {"fallback_direct": True, "retry_ms": retry_ms} if fallback_direct else {}
         updated = self._record_refresh_success(
             active_token,
             result,
@@ -4327,6 +4360,8 @@ class AccountService:
             expected_remote_check_marker=successful_remote_check_marker,
         )
         if updated is not None:
+            if image_preflight_context is not None:
+                image_preflight_context.update(preflight_context)
             return updated
         # update_account 可能因为“自动移除额度耗尽账号”删除了远程确认限流的账号。
         # 调用方仍需要知道本次预检的真实结果，不能把它混成普通预检失败。
@@ -4340,6 +4375,8 @@ class AccountService:
         ):
             # A newer verification marker won the compare-and-swap. Preserve and
             # return that newer account state instead of reporting a credential race.
+            if image_preflight_context is not None:
+                image_preflight_context.update(preflight_context)
             return current_account
         # A deleted account must not leak its stale token back into the selection path.
         raise RefreshCredentialsChangedError()
@@ -4986,15 +5023,19 @@ class AccountService:
         return items
 
     def get_stats(self) -> dict:
+        from services.account_view import account_status_category
+
         self._refresh_accounts_snapshot_if_stale()
         with self._lock:
             items = list(self._accounts.values())
         total = len(items)
-        active = sum(1 for a in items if a.get("status") == "正常")
-        limited = sum(1 for a in items if a.get("status") == "限流")
-        abnormal = sum(1 for a in items if a.get("status") == "异常")
-        disabled = sum(1 for a in items if a.get("status") == "禁用")
-        normal_items = [a for a in items if a.get("status") == "正常"]
+        categorized = [(a, account_status_category(a)) for a in items]
+        active = sum(1 for _, category in categorized if category == "normal")
+        unverified = sum(1 for _, category in categorized if category == "unverified")
+        limited = sum(1 for _, category in categorized if category == "limited")
+        abnormal = sum(1 for _, category in categorized if category == "abnormal")
+        disabled = sum(1 for _, category in categorized if category == "disabled")
+        normal_items = [a for a, category in categorized if category == "normal"]
         total_quota = sum(max(0, int(a.get("quota") or 0)) for a in normal_items)
         unlimited = sum(1 for a in normal_items if self._is_unlimited_image_quota_account(a))
         unknown_quota = sum(
@@ -5016,6 +5057,7 @@ class AccountService:
             "total": total,
             "cumulative_total": self._cumulative_total,
             "active": active,
+            "unverified": unverified,
             "limited": limited,
             "abnormal": abnormal,
             "disabled": disabled,

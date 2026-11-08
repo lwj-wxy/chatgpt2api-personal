@@ -32,6 +32,18 @@ function validateCatalog(payload: ModelCatalogResponse | null | undefined): Mode
   ) {
     throw new Error('Invalid model catalog response')
   }
+  if (payload.image_profiles !== undefined) {
+    if (!Array.isArray(payload.image_profiles) || payload.image_profiles.some((profile) => (
+      !profile || !payload.image_models.includes(profile.model)
+      || typeof profile.label !== 'string' || typeof profile.note !== 'string'
+      || !Array.isArray(profile.size_options) || !profile.size_options.length
+      || !Array.isArray(profile.quality_options) || !profile.quality_options.length
+      || profile.size_options.some((option) => !option || typeof option.value !== 'string'
+        || typeof option.label !== 'string' || typeof option.ratio !== 'string'
+        || !['auto', '1K', '2K', '4K'].includes(option.resolution))
+      || profile.quality_options.some((option) => !option || typeof option.value !== 'string' || typeof option.label !== 'string')
+    ))) throw new Error('Invalid image model profiles')
+  }
   return payload
 }
 

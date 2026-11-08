@@ -13,6 +13,7 @@ from concurrent.futures import (
     wait,
 )
 from dataclasses import dataclass, field, replace
+from threading import BoundedSemaphore
 from typing import Any, Callable, Iterable, Iterator
 
 import tiktoken
@@ -53,8 +54,11 @@ from utils.helper import (
     is_codex_image_model,
     is_supported_image_model,
     split_image_model,
+    validate_image_parameters,
+    CODEX_RESPONSES_MODEL,
+    CODEX_RESPONSES_IMAGE_MODEL,
 )
-from utils.image_tokens import count_image_content_tokens, image_output_metadata, image_size_from_bytes
+from utils.image_tokens import count_image_content_tokens, count_image_inputs_tokens, image_output_metadata, image_size_from_bytes
 from utils.log import logger
 from utils.diagnostics import diagnostic_excerpt
 from utils.svg import svg_dimensions
@@ -509,9 +513,23 @@ def build_image_prompt(
 ) -> str:
     hints = []
     option_hints = []
-    if size:
-        hints.append(f"输出图片尺寸为 {size}。")
-    if quality:
+    if size and size != "auto":
+        match = re.fullmatch(r"(\d+)x(\d+)", str(size))
+        if match and all(int(value) > 0 for value in match.groups()):
+            from math import gcd
+            width, height = map(int, match.groups())
+            divisor = gcd(width, height)
+            hints.append(
+                f"原生图片生成要求：画布宽 {width} 像素、高 {height} 像素，"
+                f"size={size}，宽高比 {width // divisor}:{height // divisor}。"
+                "请在图片生成工具的原生参数中设置此尺寸，直接按此画布生成。"
+                "不要使用默认尺寸替代，不要通过拉伸、裁切、补边或放大小图替代原生生成。"
+                "如果工具无法控制这个精确尺寸，请保留工具返回的原生图片和实际尺寸，不要用后处理冒充原生目标尺寸。"
+                "这些参数是生成要求，不要把参数或数字绘制到图片中。"
+            )
+        else:
+            hints.append(f"输出图片尺寸为 {size}。")
+    if quality and quality != "auto":
         hints.append(f"输出图片质量为 {quality}。")
     normalized_output_format = normalize_image_output_format(output_format)
     if normalized_output_format:
@@ -601,6 +619,41 @@ def count_text_tokens(text: str, model: str) -> int:
     return len(encoding_for_model(model).encode(text))
 
 
+_IMAGE_USAGE_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="image-usage")
+_IMAGE_USAGE_SLOTS = BoundedSemaphore(8)
+
+
+def prepare_image_input_usage(
+    prompt: str,
+    model: str,
+    images: Iterable[tuple[bytes, str, str]] = (),
+) -> Callable[[], dict[str, int]]:
+    """Overlap input accounting with generation; bound running and queued work."""
+    inputs = tuple(images)
+
+    def compute() -> dict[str, int]:
+        return {
+            "input_text_tokens": count_text_tokens(prompt, model),
+            "input_image_tokens": count_image_inputs_tokens(list(inputs), model),
+        }
+
+    slots = _IMAGE_USAGE_SLOTS
+    if not slots.acquire(blocking=False):
+        # Keep the response contract under overload without starting more
+        # workers or retaining additional queued reference images.
+        return compute
+    try:
+        pending = _IMAGE_USAGE_EXECUTOR.submit(compute)
+    except RuntimeError:
+        slots.release()
+        return compute
+    except BaseException:
+        slots.release()
+        raise
+    pending.add_done_callback(lambda _: slots.release())
+    return pending.result
+
+
 def format_image_result(
     items: list[dict[str, Any]],
     prompt: str,
@@ -621,6 +674,9 @@ def format_image_result(
             continue
         revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
         image_bytes = base64.b64decode(b64_json)
+        if normalized_output_format == "gif" and not image_bytes.startswith((b"GIF87a", b"GIF89a")):
+            raise ImageDownloadError("upstream did not return a GIF image")
+        source_dimensions = svg_dimensions(image_bytes) if normalized_output_format == "svg" else image_size_from_bytes(image_bytes)
         dimensions = None
         if normalized_output_format == "svg":
             dimensions = svg_dimensions(image_bytes)
@@ -653,6 +709,9 @@ def format_image_result(
         dimensions = dimensions or image_size_from_bytes(image_bytes)
         if dimensions:
             asset["width"], asset["height"] = dimensions
+        asset["_generation"] = {"postprocess": "resize" if source_dimensions != dimensions else "none"}
+        if source_dimensions:
+            asset["_generation"]["source_width"], asset["_generation"]["source_height"] = source_dimensions
         data.append(asset)
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
     if image_urls:
@@ -1838,6 +1897,9 @@ def _image_result_output_from_urls(
 ) -> ImageOutput | None:
     if not image_urls:
         return None
+    # Each pool slot requests one image. Web may return extra variants; keep
+    # them out of downloads, saved assets, usage and both response formats.
+    image_urls = image_urls[:1]
     if request.progress_callback:
         request.progress_callback("receiving_image")
     downloaded_images = _download_image_bytes_with_monitor(
@@ -1866,6 +1928,9 @@ def _image_result_output_from_urls(
     data = formatted["data"]
     if not data:
         return None
+    for item in data:
+        evidence = backend.image_evidence_for_url(image_urls[0]) if callable(getattr(backend, "image_evidence_for_url", None)) else {}
+        item["_generation"].update(evidence)
     return ImageOutput(
         kind="result",
         model=request.model,
@@ -2257,6 +2322,8 @@ def stream_codex_image_outputs(
     )
     data = formatted["data"]
     if data:
+        for item in data:
+            item["_generation"].update(requested_model=request.model, upstream_model=CODEX_RESPONSES_MODEL, requested_tool_model=CODEX_RESPONSES_IMAGE_MODEL)
         yield ImageOutput(
             kind="result",
             model=request.model,
@@ -2288,6 +2355,7 @@ def _generate_single_image(
     fallback_retry_pending = False
     fallback_retry_used = False
     fallback_from_egress: dict[str, Any] = {}
+    image_preflight_context: dict[str, Any] = {}
     image_attempts: list[dict[str, Any]] = []
     retry_error: ImageGenerationError | None = None
     pending_switch_attempt_index: int | None = None
@@ -2360,6 +2428,7 @@ def _generate_single_image(
                     plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
                     excluded_tokens=attempted_tokens,
                     deadline_monotonic=request.deadline_monotonic or None,
+                    image_preflight_context=image_preflight_context,
                 )
                 attempted_tokens.add(token)
                 account_attempt_started = account_wait_started
@@ -2558,6 +2627,8 @@ def _generate_single_image(
             request,
             "image_account_lookup",
             account_wait_ms=account_wait_ms,
+            account_preflight_retry_ms=int(image_preflight_context.get("retry_ms", 0)),
+            preflight_fallback_reused=bool(image_preflight_context.get("fallback_direct")),
             account_email=account_email,
             account_found=bool(account),
             max_account_attempts=max_account_attempts,
@@ -2600,6 +2671,13 @@ def _generate_single_image(
                         failure=image_failure("upstream_connection_failed"),
                         account_email=account_email,
                     )
+            elif image_preflight_context.get("fallback_direct"):
+                # Keep the successful preflight egress for this image only, even
+                # if the account's fixed proxy or configured fallback changes.
+                fallback_profile = replace(
+                    proxy_settings.get_profile(proxy="direct", upstream=True),
+                    proxy_source="preflight_fallback_direct",
+                )
             backend = OpenAIBackendAPI(
                 access_token=token,
                 proxy_profile=fallback_profile,
@@ -2813,14 +2891,18 @@ def _generate_single_image(
             attempt_conversation_id = str(getattr(exc, "conversation_id", "") or attempt_conversation_id)
             stream_error_ms = int((time.perf_counter() - stream_started) * 1000) if stream_started > 0 else 0
             http_timing = _backend_http_timing_data(backend)
-            quick_timeout_retry_ms = min(30000, max(5000, int(config.image_stream_timeout_secs * 1000 * 0.2)))
             early_connection_failure = (
                 not emitted_for_token
-                and (stream_error_ms == 0 or stream_error_ms <= quick_timeout_retry_ms)
+                and backend is not None
+                and backend.proxy_profile.egress_mode == "proxy"
+                and not getattr(backend, "image_generation_submitted", False)
+                and (
+                    not request.deadline_monotonic
+                    or time.monotonic() < request.deadline_monotonic
+                )
                 and failure.code in {
                     "upstream_connection_failed",
                     "upstream_connection_timeout",
-                    "upstream_unavailable",
                 }
             )
             fallback_reference = proxy_settings.get_fallback_proxy_reference()
@@ -2831,7 +2913,6 @@ def _generate_single_image(
                 fallback_from_egress = _backend_egress_data(backend) if backend is not None else {}
                 logger.warning({
                     "event": "image_stream_fallback_retry",
-                    "request_token": token,
                     "account_email": account_email,
                     "index": index,
                     "fallback_proxy_configured": True,
@@ -2844,6 +2925,7 @@ def _generate_single_image(
                     _monitor_image_stage(
                         request,
                         "image_egress_fallback_retry",
+                        egress_retry_ms=stream_error_ms,
                         account_email=account_email,
                         index=index,
                         total=total,
@@ -2923,7 +3005,10 @@ def _generate_single_image(
                 quota_consumed=(failure.code == "image_download_failed"),
             )
             attach_attempts(image_error)
-            if retry_with_different_account(failure, image_error):
+            if (
+                not getattr(backend, "image_generation_submitted", False)
+                and retry_with_different_account(failure, image_error)
+            ):
                 continue
             if image_error is exc:
                 raise
@@ -2985,6 +3070,7 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
         normalized_output_format,
         has_references=bool(request.images),
     )
+    validate_image_parameters(request.size, request.quality)
     if not is_supported_image_model(request.model):
         _monitor_image_stage(
             request,

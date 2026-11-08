@@ -31,6 +31,9 @@ requirements may move to `archive/` after links and this index are updated.
 
 - [`0001-image-gif-output.md`](0001-image-gif-output.md) — GIF/SVG output and
   gpt-image-2.6 compatibility (`implementing`).
+- [0001: Separate unverified accounts from normal accounts](0001-account-verification-status.md)
+- [0002: Reuse successful preflight egress within an image request](0002-request-local-preflight-egress.md)
+- [0003: Image route evidence and parameter capabilities](0003-image-model-capabilities.md)
 
 PRDs are planning evidence, never proof that the product already behaves as
 described.

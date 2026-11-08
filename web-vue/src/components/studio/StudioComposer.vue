@@ -147,6 +147,7 @@
                       selected-indicator="none"
                       block
                     />
+                    <p v-if="selectedImageProfile" class="mt-2 text-xs leading-relaxed text-muted-foreground">{{ selectedImageProfile.note }}</p>
                   </div>
                   <div class="studio-size-section">
                     <div class="studio-size-label">输出格式</div>
@@ -185,10 +186,10 @@
                     </div>
                   </div>
                   <div class="studio-size-section">
-                    <div class="studio-size-label">质量</div>
+                    <div class="studio-size-label">{{ selectedImageProfile?.quality_label || '质量' }}</div>
                     <div class="studio-choice-grid is-quality">
                       <Button
-                        v-for="option in IMAGE_QUALITY_OPTIONS"
+                        v-for="option in imageQualityOptions"
                         :key="option.value"
                         size="sm"
                         :variant="imageForm.quality === option.value ? 'primary' : 'outline'"
@@ -227,7 +228,7 @@
                     </div>
                   </div>
                   <div class="studio-size-section">
-                    <div class="studio-size-label">比例</div>
+                    <div class="studio-size-label">{{ selectedImageProfile?.size_label || '比例' }}</div>
                     <div class="studio-choice-grid is-ratio">
                       <Button
                         v-for="option in ratioOptions"
@@ -352,6 +353,7 @@ const props = defineProps<{
   imageForm: StudioImageForm
   chatModelOptions: string[]
   imageModelOptions: string[]
+  imageProfiles?: import('@/api/models').ImageModelProfile[]
   imageHighResolutionEnabled: boolean
   imageGifEnabled: boolean
   imageMaxN?: number
@@ -494,7 +496,7 @@ const chatReasoningEffortOptions = [
 ]
 
 const imageModelSelectOptions = computed(() => props.imageModelOptions.map((model) => ({
-  label: model,
+  label: props.imageProfiles?.find((profile) => profile.model === model)?.label || model,
   value: model,
 })))
 
@@ -507,7 +509,9 @@ const imageOutputFormatOptions = computed(() => [
   ...(props.imageGifEnabled && !props.references.length ? [{ label: 'SVG', value: 'svg' }] : []),
 ])
 
-const sizePresets = computed(() => resolveImageSizePresets(props.imageHighResolutionEnabled))
+const selectedImageProfile = computed(() => props.imageProfiles?.find((profile) => profile.model === props.imageForm.model))
+const imageQualityOptions = computed(() => selectedImageProfile.value?.quality_options || IMAGE_QUALITY_OPTIONS)
+const sizePresets = computed(() => selectedImageProfile.value?.size_options || resolveImageSizePresets(props.imageHighResolutionEnabled))
 const selectedPreset = computed(() => sizePresets.value.find((preset) => preset.value === props.imageForm.size))
 const selectedRatio = computed(() => selectedPreset.value?.ratio || 'auto')
 const selectedResolution = computed(() => selectedPreset.value?.resolution || 'auto')

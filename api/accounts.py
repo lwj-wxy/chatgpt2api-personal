@@ -39,7 +39,7 @@ from services.account_operation_events import (
 from services.account_import_job import RemoteImportJobConflictError
 from services.account_test_service import account_test_service
 from services.account_service import account_service
-from services.account_view import account_detail, account_row, account_status_category
+from services.account_view import AccountStatusCategory, account_detail, account_row, account_status_category
 from services.config import config
 from services.cpa_service import cpa_config, cpa_import_service, list_remote_files
 from services.log_service import LoggedCall
@@ -351,7 +351,7 @@ def _upsert_account_group(body: AccountGroupRequest) -> dict[str, Any]:
     )
 
 
-def _account_status_category(account: dict[str, Any]) -> Literal["normal", "limited", "abnormal", "disabled"]:
+def _account_status_category(account: dict[str, Any]) -> AccountStatusCategory:
     return account_status_category(account)
 
 
@@ -926,17 +926,10 @@ def _status_matches_filter(account: dict[str, Any], status_filter: str) -> bool:
     status_filter = status_filter.strip().lower()
     if not status_filter or status_filter == "all":
         return True
-    if status_filter in {"normal", "limited", "abnormal", "disabled"}:
+    status_filter = {"正常": "normal", "待验证": "unverified", "限流": "limited", "异常": "abnormal", "禁用": "disabled"}.get(status_filter, status_filter)
+    if status_filter in {"normal", "unverified", "limited", "abnormal", "disabled"}:
         return _account_status_category(account) == status_filter
-    status = _clean_text(account.get("status"))
-    status_map = {
-        "normal": "\u6b63\u5e38",
-        "limited": "\u9650\u6d41",
-        "abnormal": "\u5f02\u5e38",
-        "disabled": "\u7981\u7528",
-    }
-    expected = status_map.get(status_filter)
-    return status == expected if expected else status.lower() == status_filter
+    return _clean_text(account.get("status")).lower() == status_filter
 
 
 def _account_matches_keyword(account: dict[str, Any], keyword: str) -> bool:

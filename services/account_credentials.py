@@ -27,6 +27,18 @@ class UpstreamCredentialAvailability:
     refresh_status: RefreshTokenStatus
 
 
+def access_token_has_invalid_format(access_token: str) -> bool:
+    """Reject characters that cannot be part of a bearer credential.
+
+    Keep opaque ASCII credentials compatible: a missing JWT expiry is not
+    evidence of invalidity, but Unicode, controls and embedded spaces are.
+    """
+    token = str(access_token or "").strip()
+    return bool(token) and (
+        not token.isascii() or any(ord(char) <= 32 or ord(char) == 127 for char in token)
+    )
+
+
 def decode_access_token_payload(access_token: str) -> dict[str, object]:
     try:
         payload = str(access_token or "").split(".")[1]
@@ -74,7 +86,7 @@ def project_access_token_lifecycle(
     now_seconds: int | None = None,
 ) -> AccessTokenLifecycle:
     normalized_token = str(access_token or "").strip()
-    if not normalized_token:
+    if not normalized_token or access_token_has_invalid_format(normalized_token):
         return AccessTokenLifecycle(
             status="invalid",
             issued_at=None,

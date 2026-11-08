@@ -53,6 +53,26 @@ compatibility names and do not force a particular official API image engine or
 quality entitlement. Existing `gpt-image-2` and Codex routing and the default
 image model remain unchanged.
 
+The catalog additionally projects `image_profiles`: wire route, selection
+semantics, target-size presets, quality options and explanatory labels. Web
+sizes and qualities are prompt hints, including 2K/4K goals; these are not native
+resolution guarantees. Studio consumes these profiles and retains legacy
+catalog support. Parameter syntax and bounds are checked before account selection.
+
+Image result metadata measures original bytes before optional local upscaling
+and delivered bytes afterward. Private `_generation` evidence follows the
+existing Call Record metadata path and is removed from public responses.
+`server_ste_metadata.model_slug` identifies the reported conversation model,
+never the actual image engine. Only explicit generation metadata on an image
+tool result can supply actual image model/quality; missing and historical facts
+remain unknown. No extra result queries are issued for these fields.
+Image-tool observations require a generation identifier and are associated
+with the output asset ID and its resolved delivery URL before being attached
+to a result. Other tools and reference assets are not generation evidence.
+Codex logs distinguish the submitted Responses conversation model (`gpt-5.5`)
+from the submitted image-tool model (`gpt-image-2`), neither of which proves an
+effective image-engine version.
+
 ## Domain and persistence ownership
 
 | Domain | Owning Module | Stable Interface/output | Persistence |
@@ -106,3 +126,11 @@ flowchart LR
 Use [`critical-flows.md`](critical-flows.md) when a change crosses these
 boundaries; use CodeGraph only to discover additional callers and verify them
 against source.
+
+Resolution presets are owned by `services/model_catalog_service.py` and
+cross-checked against ToolOrbit's public size catalog. The Web protocol's
+`build_image_prompt` requests native canvas dimensions and an exact aspect
+ratio, while the capability projection remains `prompt_hint`. Result metadata
+and decoded image dimensions remain authoritative; no provider switch, resize
+or additional generation retry is introduced by preset unification. See
+[`0003-image-model-capabilities.md`](../requirements/0003-image-model-capabilities.md).
